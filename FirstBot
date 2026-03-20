@@ -5,33 +5,34 @@ import dev.robocode.tankroyale.botapi.events.HitBotEvent;
 import dev.robocode.tankroyale.botapi.events.HitByBulletEvent;
 import dev.robocode.tankroyale.botapi.events.HitWallEvent;
 import dev.robocode.tankroyale.botapi.events.ScannedBotEvent;
+import dev.robocode.tankroyale.botapi.graphics.Color;
 
-import java.awt.Color;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.Map;
 
 public class Terminator extends Bot {
 
-    private static final double BOT_RADIUS = 18.0;
-    private static final double WALL_MARGIN = 90.0;
-    private static final double SEARCH_MOVE = 80.0;
-    private static final double NORMAL_MOVE = 125.0;
-    private static final double ESCAPE_MOVE = 150.0;
-
-    private static final int TARGET_STALE_TURNS = 10;
-    private static final int DROP_STALE_TURNS = 28;
-    private static final int BURST_TURNS = 6;
-
-    private enum BattleMode {
-        SEARCH,
-        ESCAPE_WALL,
-        MELEE,
-        DUEL,
-        RAM
+    // ===== Easy switches =====
+    private enum LogMode {
+        OFF,
+        BASIC,
+        VERBOSE
     }
 
-    private static final class Enemy {
+    private static final LogMode LOG_MODE = LogMode.VERBOSE; // OFF for submission
+    private static final int BASIC_LOG_EVERY_N_TURNS = 10;
+
+    // ===== Modes =====
+    private enum Mode {
+        SEARCH,
+        ATTACK,
+        ESCAPE_WALL
+    }
+
+    // ===== Enemy tracking =====
+    private static class Enemy {
         final int id;
         double x;
         double y;
@@ -39,21 +40,37 @@ public class Terminator extends Bot {
         double direction;
         double speed;
         int lastSeenTurn;
-        int possibleFireTurn = Integer.MIN_VALUE;
+        int possibleFireTurn = -9999;
 
         Enemy(int id) {
             this.id = id;
         }
     }
 
+    // ===== Core tuning =====
+    private static final double EDGE_BUFFER = 60.0;
+    private static final double SEARCH_MOVE = 70.0;
+    private static final double ATTACK_MOVE = 120.0;
+    private static final double WALL_ESCAPE_MOVE = 145.0;
+
+    private static final int TARGET_STALE_TURNS = 16;
+    private static final int DROP_TARGET_TURNS = 40;
+    private static final int SEARCH_SHOT_MAX_AGE = 3;
+    private static final int BURST_TURNS = 6;
+
+    // ===== Ram conditions =====
+    private static final double RAM_DISTANCE = 170.0;
+    private static final double RAM_ENEMY_ENERGY = 12.0;
+    private static final double RAM_ENERGY_ADVANTAGE = 10.0;
+
     private final Map<Integer, Enemy> enemies = new HashMap<>();
 
+    private Mode mode = Mode.SEARCH;
     private Enemy target;
-    private BattleMode mode = BattleMode.SEARCH;
 
     private double moveDirection = 1.0;
     private boolean reverseNextTurn = false;
-    private int burstUntilTurn = Integer.MIN_VALUE;
+    private int burstUntilTurn = -1;
 
     public static void main(String[] args) {
         new Terminator().start();
@@ -69,42 +86,48 @@ public class Terminator extends Bot {
 
         while (isRunning()) {
             cleanupOldEnemies();
-            pickTarget();
-            resolveMode();
+
+            if (target == null || isTargetStale(target)) {
+                pickTarget();
+            }
 
             if (reverseNextTurn) {
                 moveDirection = -moveDirection;
                 reverseNextTurn = false;
             }
 
+            resolveMode();
             handleRadar();
             handleGun();
             handleMovement();
 
             go();
+            debugTurn();
         }
     }
 
     private void initializeRound() {
         enemies.clear();
         target = null;
-        mode = BattleMode.SEARCH;
+        mode = Mode.SEARCH;
         moveDirection = 1.0;
         reverseNextTurn = false;
-        burstUntilTurn = Integer.MIN_VALUE;
+        burstUntilTurn = -1;
 
-        setBodyColor(new Color(20, 20, 20));
-        setTurretColor(new Color(75, 75, 75));
-        setRadarColor(Color.RED);
-        setScanColor(Color.YELLOW);
-        setBulletColor(Color.ORANGE);
-        setTracksColor(Color.DARK_GRAY);
+        setBodyColor(Color.fromRgb(0x20, 0x20, 0x20));
+        setTurretColor(Color.fromRgb(0x70, 0x70, 0x70));
+        setGunColor(Color.fromRgb(0x70, 0x70, 0x70));
+        setRadarColor(Color.fromRgb(0xFF, 0x55, 0x55));
+        setScanColor(Color.fromRgb(0xFF, 0xCC, 0x00));
+        setBulletColor(Color.fromRgb(0xFF, 0x99, 0x00));
+        setTracksColor(Color.fromRgb(0x55, 0x55, 0x55));
 
         setAdjustGunForBodyTurn(true);
         setAdjustRadarForBodyTurn(true);
         setAdjustRadarForGunTurn(true);
-
         setMaxSpeed(8);
+
+        logVerbose("Initialized round");
     }
 
     @Override
@@ -116,6 +139,7 @@ public class Terminator extends Bot {
             double energyDrop = previousEnergy - e.getEnergy();
             if (energyDrop >= 0.1 && energyDrop <= 3.0) {
                 enemy.possibleFireTurn = e.getTurnNumber();
+                logVerbose("Enemy #" + enemy.id + " likely fired. Drop=" + energyDrop);
             }
         }
 
@@ -125,6 +149,34 @@ public class Terminator extends Bot {
         enemy.direction = e.getDirection();
         enemy.speed = e.getSpeed();
         enemy.lastSeenTurn = e.getTurnNumber();
+
+        // Keep current target fresh if this is the same bot
+        if (target != null && target.id == enemy.id) {
+            target = enemy;
+            return;
+        }
+
+        // No target or stale target? Grab this immediately
+        if (target == null || isTargetStale(target)) {
+            target = enemy;
+            logVerbose("New target from scan: #" + enemy.id);
+            return;
+        }
+
+        // Duel: always stick to the only scanned enemy
+        if (getEnemyCount() <= 1) {
+            target = enemy;
+            return;
+        }
+
+        // Melee: switch only if clearly better
+        double currentDist = distanceTo(target.x, target.y);
+        double newDist = distanceTo(enemy.x, enemy.y);
+
+        if (newDist < currentDist * 0.85 || enemy.energy < target.energy - 15.0) {
+            target = enemy;
+            logVerbose("Switched target to #" + enemy.id);
+        }
     }
 
     @Override
@@ -148,6 +200,14 @@ public class Terminator extends Bot {
     @Override
     public void onHitBot(HitBotEvent e) {
         reverseNextTurn = true;
+
+        // Refresh target from collision info
+        Enemy enemy = enemies.computeIfAbsent(e.getVictimId(), Enemy::new);
+        enemy.x = e.getX();
+        enemy.y = e.getY();
+        enemy.energy = e.getEnergy();
+        enemy.lastSeenTurn = getTurnNumber();
+        target = enemy;
     }
 
     private void cleanupOldEnemies() {
@@ -156,7 +216,7 @@ public class Terminator extends Bot {
 
         while (it.hasNext()) {
             Enemy enemy = it.next().getValue();
-            if (now - enemy.lastSeenTurn > DROP_STALE_TURNS) {
+            if (now - enemy.lastSeenTurn > DROP_TARGET_TURNS) {
                 if (target != null && target.id == enemy.id) {
                     target = null;
                 }
@@ -166,11 +226,6 @@ public class Terminator extends Bot {
     }
 
     private void pickTarget() {
-        if (enemies.isEmpty()) {
-            target = null;
-            return;
-        }
-
         Enemy best = null;
         double bestScore = Double.POSITIVE_INFINITY;
         int now = getTurnNumber();
@@ -182,15 +237,16 @@ public class Terminator extends Bot {
             }
 
             double distance = distanceTo(enemy.x, enemy.y);
-            double score = distance;
-            score += age * 45.0;
-            score += enemy.energy * 3.0;
+            double score = distance + age * 25.0 + enemy.energy * 3.0;
 
-            if (target != null && target.id == enemy.id) {
-                score -= 35.0;
+            // Prefer bots that might just have fired
+            if (enemy.possibleFireTurn >= now - 1) {
+                score -= 30.0;
             }
-            if (enemy.energy <= 0.2) {
-                score += 1000.0;
+
+            // Slightly prefer keeping current target
+            if (target != null && target.id == enemy.id) {
+                score -= 20.0;
             }
 
             if (score < bestScore) {
@@ -204,75 +260,39 @@ public class Terminator extends Bot {
 
     private void resolveMode() {
         if (nearWall()) {
-            mode = BattleMode.ESCAPE_WALL;
+            mode = Mode.ESCAPE_WALL;
             return;
         }
 
         if (target == null || isTargetStale(target)) {
-            mode = BattleMode.SEARCH;
+            mode = Mode.SEARCH;
             return;
         }
 
-        double distance = distanceTo(target.x, target.y);
+        mode = Mode.ATTACK;
+
         boolean duel = getEnemyCount() <= 1;
+        double distance = distanceTo(target.x, target.y);
 
-        if (!duel) {
-            mode = BattleMode.MELEE;
-            return;
-        }
-
-        if (target.energy < 20.0 && distance < 250.0) {
+        if (duel && target.energy < 20.0 && distance < 250.0) {
             burstUntilTurn = Math.max(burstUntilTurn, getTurnNumber() + BURST_TURNS);
         }
-
-        boolean safeToRam = target.energy < 12.0
-                && getEnergy() > target.energy + 10.0
-                && distance < 170.0
-                && !nearWall();
-
-        mode = safeToRam ? BattleMode.RAM : BattleMode.DUEL;
     }
 
     private void handleRadar() {
-        if (mode == BattleMode.SEARCH) {
-            setTurnRadarRight(Double.POSITIVE_INFINITY);
+        if (target == null) {
+            setTurnRadarRight(360.0);
             return;
         }
 
-        if (mode == BattleMode.DUEL || mode == BattleMode.RAM) {
-            double bearing = radarBearingTo(target.x, target.y);
-            double overshoot = (bearing >= 0.0) ? 12.0 : -12.0;
-            setTurnRadarRight(bearing + overshoot);
+        double bearing = radarBearingTo(target.x, target.y);
+
+        if (mode == Mode.SEARCH) {
+            setTurnRadarRight(bearing + (bearing >= 0 ? 40.0 : -40.0));
             return;
         }
 
-        Enemy oldest = getOldestRecentlySeenEnemy();
-        if (oldest == null) {
-            setTurnRadarRight(Double.POSITIVE_INFINITY);
-            return;
-        }
-
-        double bearing = radarBearingTo(oldest.x, oldest.y);
-        double overshoot = (bearing >= 0.0) ? 20.0 : -20.0;
-        setTurnRadarRight(bearing + overshoot);
-    }
-
-    private Enemy getOldestRecentlySeenEnemy() {
-        Enemy oldest = null;
-        int oldestTurn = Integer.MAX_VALUE;
-        int now = getTurnNumber();
-
-        for (Enemy enemy : enemies.values()) {
-            int age = now - enemy.lastSeenTurn;
-            if (age > TARGET_STALE_TURNS) {
-                continue;
-            }
-            if (enemy.lastSeenTurn < oldestTurn) {
-                oldestTurn = enemy.lastSeenTurn;
-                oldest = enemy;
-            }
-        }
-        return oldest;
+        setTurnRadarRight(bearing + (bearing >= 0 ? 25.0 : -25.0));
     }
 
     private void handleGun() {
@@ -280,29 +300,57 @@ public class Terminator extends Bot {
             return;
         }
 
+        int age = getTurnNumber() - target.lastSeenTurn;
+
+        // In SEARCH, only take cheap speculative shots at very recent last-known positions
+        if (mode == Mode.SEARCH && age > SEARCH_SHOT_MAX_AGE) {
+            return;
+        }
+
         double distance = distanceTo(target.x, target.y);
         double firepower = chooseFirepower(distance);
-        double[] aim = predictLinearPosition(target, firepower);
-        double gunTurn = gunBearingTo(aim[0], aim[1]);
 
+        if (mode == Mode.SEARCH) {
+            firepower = Math.min(firepower, 1.0);
+        }
+
+        double directTurn = gunBearingTo(target.x, target.y);
+        double[] aim = predictLinearPosition(target, firepower);
+        double predictedTurn = gunBearingTo(aim[0], aim[1]);
+
+        // Fall back to direct aim if prediction is too jumpy
+        double gunTurn = Math.abs(predictedTurn) <= 25.0 ? predictedTurn : directTurn;
         setTurnGunRight(gunTurn);
 
-        if (getGunHeat() <= 0.0
-                && Math.abs(gunTurn) <= gunTolerance(distance)
-                && getEnergy() > firepower + 0.1) {
+        boolean duel = getEnemyCount() <= 1;
+        boolean ramNow = shouldRam(distance);
+
+        double tolerance;
+        if (ramNow) {
+            tolerance = 18.0;
+        } else if (duel) {
+            tolerance = 14.0;
+        } else {
+            tolerance = 12.0;
+        }
+
+        if (getGunHeat() <= 0.05
+                && Math.abs(gunTurn) <= tolerance
+                && getEnergy() > firepower + 0.2) {
             setFire(firepower);
         }
     }
 
     private double chooseFirepower(double distance) {
-        boolean burstMode = getTurnNumber() <= burstUntilTurn;
-        double power;
+        boolean duel = getEnemyCount() <= 1;
+        boolean burstMode = duel && getTurnNumber() <= burstUntilTurn;
 
-        if (mode == BattleMode.RAM) {
+        double power;
+        if (shouldRam(distance)) {
             power = 2.6;
-        } else if (burstMode && mode == BattleMode.DUEL) {
+        } else if (burstMode) {
             power = 1.0;
-        } else if (mode == BattleMode.DUEL) {
+        } else if (duel) {
             if (distance < 140.0) {
                 power = 2.4;
             } else if (distance < 320.0) {
@@ -313,7 +361,7 @@ public class Terminator extends Bot {
         } else {
             if (distance < 160.0) {
                 power = 1.8;
-            } else if (distance < 350.0) {
+            } else if (distance < 340.0) {
                 power = 1.3;
             } else {
                 power = 1.0;
@@ -321,25 +369,29 @@ public class Terminator extends Bot {
         }
 
         if (target != null) {
-            power = Math.min(power, target.energy / 4.0 + 0.4);
+            power = Math.min(power, target.energy / 3.0 + 0.6);
         }
-        power = Math.min(power, getEnergy() / 6.0 + 0.5);
 
-        return clamp(power, 0.5, 3.0);
+        power = Math.min(power, getEnergy() / 6.0 + 0.6);
+
+        if (power < 0.5) power = 0.5;
+        if (power > 3.0) power = 3.0;
+
+        return power;
     }
 
-    private double gunTolerance(double distance) {
-        if (distance < 140.0) {
-            return 10.0;
-        }
-        if (distance < 300.0) {
-            return 7.0;
-        }
-        return 5.0;
+    private boolean shouldRam(double distance) {
+        return getEnemyCount() <= 1
+                && target != null
+                && target.energy < RAM_ENEMY_ENERGY
+                && getEnergy() > target.energy + RAM_ENERGY_ADVANTAGE
+                && distance < RAM_DISTANCE
+                && !nearWall();
     }
 
     private double[] predictLinearPosition(Enemy enemy, double firepower) {
         double bulletSpeed = Math.max(0.1, calcBulletSpeed(firepower));
+
         double vx = Math.cos(Math.toRadians(enemy.direction)) * enemy.speed;
         double vy = Math.sin(Math.toRadians(enemy.direction)) * enemy.speed;
 
@@ -347,86 +399,81 @@ public class Terminator extends Bot {
         double py = enemy.y;
 
         for (int i = 0; i < 5; i++) {
-            double time = distanceTo(px, py) / bulletSpeed;
+            double distance = distanceTo(px, py);
+            double time = distance / bulletSpeed;
+
             px = enemy.x + vx * time;
             py = enemy.y + vy * time;
-            px = clamp(px, BOT_RADIUS, getArenaWidth() - BOT_RADIUS);
-            py = clamp(py, BOT_RADIUS, getArenaHeight() - BOT_RADIUS);
+
+            px = clamp(px, EDGE_BUFFER, getArenaWidth() - EDGE_BUFFER);
+            py = clamp(py, EDGE_BUFFER, getArenaHeight() - EDGE_BUFFER);
         }
 
-        return new double[] { px, py };
+        return new double[]{px, py};
     }
 
     private void handleMovement() {
-        if (mode == BattleMode.ESCAPE_WALL) {
+        if (mode == Mode.ESCAPE_WALL) {
             double centerDirection = directionTo(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
-            goToDirection(centerDirection, ESCAPE_MOVE);
+            goToDirection(centerDirection, WALL_ESCAPE_MOVE);
             return;
         }
 
-        if (mode == BattleMode.SEARCH) {
+        if (mode == Mode.SEARCH) {
             if (getTurnNumber() % 18 == 0) {
                 moveDirection = -moveDirection;
             }
-            double desiredDirection = normalizeAbsoluteAngle(getDirection() + 35.0 * moveDirection);
-            goToDirection(desiredDirection, SEARCH_MOVE);
+
+            goToDirection(normalizeAbsoluteAngle(getDirection() + 30.0 * moveDirection), SEARCH_MOVE);
             return;
         }
 
         double targetDirection = directionTo(target.x, target.y);
         double distance = distanceTo(target.x, target.y);
+        boolean duel = getEnemyCount() <= 1;
 
-        if (mode == BattleMode.RAM) {
-            goToDirection(targetDirection, Math.min(220.0, distance + 40.0));
+        if (shouldRam(distance)) {
+            goToDirection(targetDirection, Math.min(220.0, distance + 30.0));
             return;
         }
 
-        if (recentlyFiredAtUs(target)) {
+        if (recentlyFiredAtUs(target) || getTurnNumber() % (duel ? 24 : 30) == 0) {
             moveDirection = -moveDirection;
         }
 
-        if (mode == BattleMode.DUEL) {
-            if (getTurnNumber() % 23 == 0) {
-                moveDirection = -moveDirection;
-            }
-
-            double desiredDirection;
+        double desiredDirection;
+        if (duel) {
             if (distance < 140.0) {
-                desiredDirection = targetDirection + 140.0 * moveDirection;
+                desiredDirection = targetDirection + 120.0 * moveDirection;
             } else if (distance > 380.0) {
                 desiredDirection = targetDirection + 60.0 * moveDirection;
             } else {
                 desiredDirection = targetDirection + 90.0 * moveDirection;
             }
-            goToDirection(normalizeAbsoluteAngle(desiredDirection), NORMAL_MOVE);
-            return;
+        } else {
+            desiredDirection = targetDirection + ((distance < 220.0) ? 105.0 : 75.0) * moveDirection;
         }
 
-        if (getTurnNumber() % 29 == 0) {
-            moveDirection = -moveDirection;
-        }
-
-        double desiredDirection = targetDirection + ((distance < 220.0) ? 110.0 : 75.0) * moveDirection;
-        goToDirection(normalizeAbsoluteAngle(desiredDirection), NORMAL_MOVE);
-    }
-
-    private boolean recentlyFiredAtUs(Enemy enemy) {
-        return getTurnNumber() - enemy.possibleFireTurn <= 1;
+        goToDirection(normalizeAbsoluteAngle(desiredDirection), ATTACK_MOVE);
     }
 
     private boolean nearWall() {
-        return getX() < WALL_MARGIN
-                || getY() < WALL_MARGIN
-                || getX() > getArenaWidth() - WALL_MARGIN
-                || getY() > getArenaHeight() - WALL_MARGIN;
+        return getX() < EDGE_BUFFER
+                || getY() < EDGE_BUFFER
+                || getX() > getArenaWidth() - EDGE_BUFFER
+                || getY() > getArenaHeight() - EDGE_BUFFER;
     }
 
     private boolean isTargetStale(Enemy enemy) {
-        return getTurnNumber() - enemy.lastSeenTurn > TARGET_STALE_TURNS;
+        return enemy == null || (getTurnNumber() - enemy.lastSeenTurn > TARGET_STALE_TURNS);
+    }
+
+    private boolean recentlyFiredAtUs(Enemy enemy) {
+        return enemy != null && getTurnNumber() - enemy.possibleFireTurn <= 1;
     }
 
     private void goToDirection(double absoluteDirection, double distance) {
-        double bearing = normalizeRelativeAngle(absoluteDirection - getDirection());
+        double bearing = calcBearing(absoluteDirection);
 
         if (Math.abs(bearing) > 90.0) {
             if (bearing > 0.0) {
@@ -441,7 +488,48 @@ public class Terminator extends Bot {
         }
     }
 
-    private static double clamp(double value, double min, double max) {
+    private double normalizeAbsoluteAngle(double angle) {
+        double result = angle % 360.0;
+        return result < 0.0 ? result + 360.0 : result;
+    }
+
+    private void debugTurn() {
+        if (LOG_MODE == LogMode.OFF) {
+            return;
+        }
+        if (LOG_MODE == LogMode.BASIC && getTurnNumber() % BASIC_LOG_EVERY_N_TURNS != 0) {
+            return;
+        }
+
+        String targetInfo;
+        if (target == null) {
+            targetInfo = "NONE";
+        } else {
+            int age = getTurnNumber() - target.lastSeenTurn;
+            targetInfo = "#" + target.id
+                    + " pos=(" + (int) target.x + "," + (int) target.y + ")"
+                    + " e=" + (int) target.energy
+                    + " age=" + age;
+        }
+
+        System.out.println("[TURN " + getTurnNumber() + "]"
+                + " mode=" + mode
+                + " pos=(" + (int) getX() + "," + (int) getY() + ")"
+                + " energy=" + (int) getEnergy()
+                + " gunHeat=" + String.format(Locale.ROOT, "%.2f", getGunHeat())
+                + " enemies=" + enemies.size()
+                + " target=" + targetInfo
+                + " moveDir=" + moveDirection
+                + " reverseNext=" + reverseNextTurn);
+    }
+
+    private void logVerbose(String msg) {
+        if (LOG_MODE == LogMode.VERBOSE) {
+            System.out.println(msg);
+        }
+    }
+
+    private double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
     }
 }
