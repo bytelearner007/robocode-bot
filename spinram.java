@@ -14,15 +14,22 @@ import java.util.Map;
 
 public class SpinRAM extends Bot {
 
+    // =========================
+    // Logging
+    // =========================
     private enum LogMode {
         OFF,
         BASIC,
         VERBOSE
     }
 
-    private static final LogMode LOG_MODE = LogMode.BASIC; // OFF for submission
+    // OFF for submission
+    private static final LogMode LOG_MODE = LogMode.BASIC;
     private static final int BASIC_LOG_EVERY_N_TURNS = 10;
 
+    // =========================
+    // Modes
+    // =========================
     private enum Mode {
         SEARCH,
         ATTACK,
@@ -44,23 +51,28 @@ public class SpinRAM extends Bot {
         }
     }
 
-    private static final double EDGE_BUFFER = 35.0;
-    private static final double EDGE_HOLD_MARGIN = 85.0;
-    private static final double CORNER_AVOID = 130.0;
+    // =========================
+    // Tuning
+    // =========================
+    private static final double TOO_CLOSE_TO_WALL = 22.0;
 
-    private static final double SEARCH_MOVE = 65.0;
-    private static final double ATTACK_MOVE = 110.0;
-    private static final double WALL_ESCAPE_MOVE = 150.0;
-    private static final double EDGE_HOLD_STEP = 145.0;
+    private static final double EDGE_LANE_MARGIN = 80.0;
+    private static final double CORNER_AVOID = 120.0;
+    private static final double EDGE_HOLD_STEP = 120.0;
 
-    private static final int TARGET_STALE_TURNS = 16;
-    private static final int DROP_TARGET_TURNS = 40;
-    private static final int SEARCH_SHOT_MAX_AGE = 3;
+    private static final double SEARCH_MOVE = 70.0;
+    private static final double ATTACK_MOVE = 100.0;
+    private static final double WALL_ESCAPE_MOVE = 120.0;
+
+    private static final int TARGET_STALE_TURNS = 12;
+    private static final int DROP_TARGET_TURNS = 30;
+    private static final int SEARCH_SHOT_MAX_AGE = 2;
     private static final int BURST_TURNS = 6;
 
-    private static final double RAM_DISTANCE = 165.0;
-    private static final double RAM_ENEMY_ENERGY = 12.0;
-    private static final double RAM_ENERGY_ADVANTAGE = 10.0;
+    // Duel-only RAM
+    private static final double RAM_DISTANCE = 155.0;
+    private static final double RAM_ENEMY_ENERGY = 10.0;
+    private static final double RAM_ENERGY_ADVANTAGE = 12.0;
 
     private final Map<Integer, Enemy> enemies = new HashMap<>();
 
@@ -123,9 +135,11 @@ public class SpinRAM extends Bot {
         setBulletColor(Color.fromRgb(0xFF, 0x66, 0x00));
         setTracksColor(Color.fromRgb(0x66, 0x66, 0x66));
 
+        // Keep gun/radar independent of body movement
         setAdjustGunForBodyTurn(true);
         setAdjustRadarForBodyTurn(true);
         setAdjustRadarForGunTurn(true);
+
         setMaxSpeed(8);
     }
 
@@ -148,21 +162,25 @@ public class SpinRAM extends Bot {
         enemy.speed = e.getSpeed();
         enemy.lastSeenTurn = e.getTurnNumber();
 
+        // Refresh current target immediately
         if (target != null && target.id == enemy.id) {
             target = enemy;
             return;
         }
 
+        // If we have no target or stale target, grab this one
         if (target == null || isTargetStale(target)) {
             target = enemy;
             return;
         }
 
+        // In duel just use the scanned enemy
         if (getEnemyCount() <= 1) {
             target = enemy;
             return;
         }
 
+        // In multiplayer only switch if clearly better
         double currentDistance = distanceTo(target.x, target.y);
         double newDistance = distanceTo(enemy.x, enemy.y);
 
@@ -221,18 +239,14 @@ public class SpinRAM extends Bot {
             }
 
             double distance = distanceTo(enemy.x, enemy.y);
-            double score = distance + age * 25.0 + enemy.energy * 3.0;
+            double score = distance + age * 20.0 + enemy.energy * 3.0;
 
             if (enemy.possibleFireTurn >= now - 1) {
-                score -= 25.0;
+                score -= 20.0;
             }
 
             if (target != null && target.id == enemy.id) {
-                score -= 20.0;
-            }
-
-            if (getEnemyCount() > 1 && enemy.energy < 20.0) {
-                score -= 20.0;
+                score -= 15.0;
             }
 
             if (score < bestScore) {
@@ -245,7 +259,7 @@ public class SpinRAM extends Bot {
     }
 
     private void resolveMode() {
-        if (nearWall()) {
+        if (tooCloseToWall()) {
             mode = Mode.ESCAPE_WALL;
             return;
         }
@@ -273,25 +287,19 @@ public class SpinRAM extends Bot {
 
         int age = getTurnNumber() - target.lastSeenTurn;
 
+        // If target info is getting stale, do a strong sweep
         if (age > 2) {
             setTurnRadarRight(45.0 * radarDirection);
             return;
         }
 
         double bearing = radarBearingTo(target.x, target.y);
+        double overshoot = (mode == Mode.SEARCH)
+                ? 35.0
+                : (getEnemyCount() <= 1 ? 18.0 : 28.0);
 
-        if (mode == Mode.SEARCH) {
-            double turn = bearing + (bearing >= 0 ? 35.0 : -35.0);
-            if (Math.abs(turn) < 8.0) {
-                turn = 45.0 * radarDirection;
-            }
-            radarDirection = turn >= 0 ? 1 : -1;
-            setTurnRadarRight(turn);
-            return;
-        }
-
-        double overshoot = (getEnemyCount() <= 1) ? 18.0 : 28.0;
         double turn = bearing + (bearing >= 0 ? overshoot : -overshoot);
+
         radarDirection = turn >= 0 ? 1 : -1;
         setTurnRadarRight(turn);
     }
@@ -303,23 +311,20 @@ public class SpinRAM extends Bot {
 
         int age = getTurnNumber() - target.lastSeenTurn;
 
+        // In SEARCH, only speculative shots at very recent last-known position
         if (mode == Mode.SEARCH && age > SEARCH_SHOT_MAX_AGE) {
             return;
         }
 
         double distance = distanceTo(target.x, target.y);
-        double firepower = chooseFirepower(distance);
+        double gunTurn = gunBearingTo(target.x, target.y);
 
+        setTurnGunRight(gunTurn);
+
+        double firepower = chooseFirepower(distance);
         if (mode == Mode.SEARCH) {
             firepower = Math.min(firepower, 1.0);
         }
-
-        double[] aim = predictLinearPosition(target, firepower);
-        double directTurn = gunBearingTo(target.x, target.y);
-        double predictedTurn = gunBearingTo(aim[0], aim[1]);
-        double gunTurn = Math.abs(predictedTurn) <= 25.0 ? predictedTurn : directTurn;
-
-        setTurnGunRight(gunTurn);
 
         boolean duel = getEnemyCount() <= 1;
         boolean ramNow = shouldRam(distance);
@@ -328,9 +333,9 @@ public class SpinRAM extends Bot {
         if (ramNow) {
             tolerance = 18.0;
         } else if (duel) {
-            tolerance = 14.0;
+            tolerance = 20.0;
         } else {
-            tolerance = 12.0;
+            tolerance = 16.0;
         }
 
         if (getGunHeat() <= 0.05
@@ -346,24 +351,24 @@ public class SpinRAM extends Bot {
 
         double power;
         if (shouldRam(distance)) {
-            power = 2.4;
+            power = 2.0;
         } else if (mode == Mode.SEARCH) {
             power = 1.0;
         } else if (burstMode) {
             power = 1.0;
         } else if (duel) {
             if (distance < 140.0) {
-                power = 2.4;
+                power = 2.2;
             } else if (distance < 320.0) {
-                power = 1.8;
+                power = 1.7;
             } else {
                 power = 1.2;
             }
         } else {
             if (distance < 150.0) {
-                power = 1.7;
+                power = 1.5;
             } else if (distance < 340.0) {
-                power = 1.25;
+                power = 1.2;
             } else {
                 power = 1.0;
             }
@@ -377,7 +382,6 @@ public class SpinRAM extends Bot {
 
         if (power < 0.5) power = 0.5;
         if (power > 3.0) power = 3.0;
-
         return power;
     }
 
@@ -387,30 +391,7 @@ public class SpinRAM extends Bot {
                 && target.energy < RAM_ENEMY_ENERGY
                 && getEnergy() > target.energy + RAM_ENERGY_ADVANTAGE
                 && distance < RAM_DISTANCE
-                && !nearWall();
-    }
-
-    private double[] predictLinearPosition(Enemy enemy, double firepower) {
-        double bulletSpeed = Math.max(0.1, calcBulletSpeed(firepower));
-
-        double vx = Math.cos(Math.toRadians(enemy.direction)) * enemy.speed;
-        double vy = Math.sin(Math.toRadians(enemy.direction)) * enemy.speed;
-
-        double px = enemy.x;
-        double py = enemy.y;
-
-        for (int i = 0; i < 5; i++) {
-            double distance = distanceTo(px, py);
-            double time = distance / bulletSpeed;
-
-            px = enemy.x + vx * time;
-            py = enemy.y + vy * time;
-
-            px = clamp(px, EDGE_BUFFER, getArenaWidth() - EDGE_BUFFER);
-            py = clamp(py, EDGE_BUFFER, getArenaHeight() - EDGE_BUFFER);
-        }
-
-        return new double[]{px, py};
+                && !tooCloseToWall();
     }
 
     private void handleMovement() {
@@ -428,7 +409,7 @@ public class SpinRAM extends Bot {
                 if (getTurnNumber() % 18 == 0) {
                     moveDirection = -moveDirection;
                 }
-                double desiredDirection = getDirection() + 35.0 * moveDirection;
+                double desiredDirection = getDirection() + 40.0 * moveDirection;
                 goToDirection(normalizeAbsoluteAngle(desiredDirection), SEARCH_MOVE);
             }
             return;
@@ -455,7 +436,7 @@ public class SpinRAM extends Bot {
         if (distance < 140.0) {
             desiredDirection = targetDirection + 120.0 * moveDirection;
         } else if (distance > 380.0) {
-            desiredDirection = targetDirection + 60.0 * moveDirection;
+            desiredDirection = targetDirection + 65.0 * moveDirection;
         } else {
             desiredDirection = targetDirection + 90.0 * moveDirection;
         }
@@ -483,14 +464,14 @@ public class SpinRAM extends Bot {
 
         if (left <= right && left <= bottom && left <= top) {
             return new double[]{
-                    EDGE_HOLD_MARGIN,
+                    EDGE_LANE_MARGIN,
                     clamp(y + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, h - CORNER_AVOID)
             };
         }
 
         if (right <= left && right <= bottom && right <= top) {
             return new double[]{
-                    w - EDGE_HOLD_MARGIN,
+                    w - EDGE_LANE_MARGIN,
                     clamp(y + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, h - CORNER_AVOID)
             };
         }
@@ -498,13 +479,13 @@ public class SpinRAM extends Bot {
         if (bottom <= left && bottom <= right && bottom <= top) {
             return new double[]{
                     clamp(x + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, w - CORNER_AVOID),
-                    EDGE_HOLD_MARGIN
+                    EDGE_LANE_MARGIN
             };
         }
 
         return new double[]{
                 clamp(x + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, w - CORNER_AVOID),
-                h - EDGE_HOLD_MARGIN
+                h - EDGE_LANE_MARGIN
         };
     }
 
@@ -515,11 +496,25 @@ public class SpinRAM extends Bot {
         setForward(WALL_ESCAPE_MOVE);
     }
 
-    private boolean nearWall() {
-        return getX() < EDGE_BUFFER
-                || getY() < EDGE_BUFFER
-                || getX() > getArenaWidth() - EDGE_BUFFER
-                || getY() > getArenaHeight() - EDGE_BUFFER;
+    private void goToDirection(double absoluteDirection, double distance) {
+        double bearing = calcBearing(absoluteDirection);
+        double turn = bearing;
+
+        if (Math.abs(bearing) > 90.0) {
+            turn = (bearing > 0.0) ? bearing - 180.0 : bearing + 180.0;
+            setTurnRight(turn);
+            setBack(distance);
+        } else {
+            setTurnRight(turn);
+            setForward(distance);
+        }
+    }
+
+    private boolean tooCloseToWall() {
+        return getX() < TOO_CLOSE_TO_WALL
+                || getY() < TOO_CLOSE_TO_WALL
+                || getX() > getArenaWidth() - TOO_CLOSE_TO_WALL
+                || getY() > getArenaHeight() - TOO_CLOSE_TO_WALL;
     }
 
     private boolean isTargetStale(Enemy enemy) {
@@ -528,22 +523,6 @@ public class SpinRAM extends Bot {
 
     private boolean recentlyFiredAtUs(Enemy enemy) {
         return enemy != null && getTurnNumber() - enemy.possibleFireTurn <= 1;
-    }
-
-    private void goToDirection(double absoluteDirection, double distance) {
-        double bearing = calcBearing(absoluteDirection);
-
-        if (Math.abs(bearing) > 90.0) {
-            if (bearing > 0.0) {
-                setTurnRight(bearing - 180.0);
-            } else {
-                setTurnRight(bearing + 180.0);
-            }
-            setBack(distance);
-        } else {
-            setTurnRight(bearing);
-            setForward(distance);
-        }
     }
 
     private void debugTurn() {
@@ -574,12 +553,6 @@ public class SpinRAM extends Bot {
                 + " target=" + targetInfo
                 + " moveDir=" + moveDirection
                 + " radarDir=" + radarDirection);
-    }
-
-    private void logVerbose(String msg) {
-        if (LOG_MODE == LogMode.VERBOSE) {
-            System.out.println(msg);
-        }
     }
 
     private double clamp(double value, double min, double max) {
