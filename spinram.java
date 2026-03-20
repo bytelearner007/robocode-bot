@@ -20,7 +20,7 @@ public class SpinRAM extends Bot {
         VERBOSE
     }
 
-    private static final LogMode LOG_MODE = LogMode.OFF; // OFF for submission
+    private static final LogMode LOG_MODE = LogMode.BASIC; // OFF for submission
     private static final int BASIC_LOG_EVERY_N_TURNS = 10;
 
     private enum Mode {
@@ -44,18 +44,19 @@ public class SpinRAM extends Bot {
         }
     }
 
-    // Wall / edge
+    // =========================
+    // Tuning
+    // =========================
     private static final double TOO_CLOSE_TO_WALL = 20.0;
+
     private static final double EDGE_LANE_MARGIN = 80.0;
     private static final double CORNER_AVOID = 120.0;
     private static final double EDGE_HOLD_STEP = 110.0;
 
-    // Movement
     private static final double SEARCH_MOVE = 70.0;
     private static final double ATTACK_MOVE = 95.0;
     private static final double WALL_ESCAPE_MOVE = 130.0;
 
-    // Target freshness
     private static final int TARGET_STALE_TURNS = 10;
     private static final int DROP_TARGET_TURNS = 26;
     private static final int SEARCH_SHOT_MAX_AGE = 2;
@@ -76,9 +77,18 @@ public class SpinRAM extends Bot {
     private boolean reverseNextTurn = false;
     private int burstUntilTurn = -1;
 
+    // Debug / timing
+    private int previousObservedTurn = -1;
+    private long previousLoopStartNanos = 0L;
+    private long maxLoopMillis = 0L;
+    private int suspectedSkippedTurns = 0;
+    private int suspectedSlowLoops = 0;
+
+    // Last commands for debug
+    private double lastBodyTurnCmd = 0.0;
     private double lastGunTurnCmd = 0.0;
     private double lastRadarTurnCmd = 0.0;
-    private double lastBodyTurnCmd = 0.0;
+    private double lastFirePowerCmd = 0.0;
 
     public static void main(String[] args) {
         new SpinRAM().start();
@@ -93,6 +103,8 @@ public class SpinRAM extends Bot {
         initializeRound();
 
         while (isRunning()) {
+            debugTimingBeforeGo();
+
             cleanupOldEnemies();
 
             if (target == null || isTargetStale(target)) {
@@ -123,9 +135,16 @@ public class SpinRAM extends Bot {
         reverseNextTurn = false;
         burstUntilTurn = -1;
 
+        previousObservedTurn = -1;
+        previousLoopStartNanos = 0L;
+        maxLoopMillis = 0L;
+        suspectedSkippedTurns = 0;
+        suspectedSlowLoops = 0;
+
+        lastBodyTurnCmd = 0.0;
         lastGunTurnCmd = 0.0;
         lastRadarTurnCmd = 0.0;
-        lastBodyTurnCmd = 0.0;
+        lastFirePowerCmd = 0.0;
 
         setBodyColor(Color.fromRgb(0xF2, 0xF2, 0xF2));
         setTurretColor(Color.fromRgb(0xCC, 0xCC, 0xCC));
@@ -266,7 +285,7 @@ public class SpinRAM extends Bot {
 
         mode = Mode.ATTACK;
 
-        boolean duel = getEnemyCount() <= 1;
+        boolean duel = getEnemyCount() == 1;
         double distance = distanceTo(target.x, target.y);
 
         if (duel && target.energy < 20.0 && distance < 240.0) {
@@ -277,7 +296,7 @@ public class SpinRAM extends Bot {
     private void handleRadar() {
         if (target == null) {
             lastRadarTurnCmd = 45.0 * radarDirection;
-            setTurnRadarLeft(lastRadarTurnCmd);
+            setTurnRadarRight(lastRadarTurnCmd);
             return;
         }
 
@@ -285,27 +304,32 @@ public class SpinRAM extends Bot {
 
         if (age > 2) {
             lastRadarTurnCmd = 45.0 * radarDirection;
-            setTurnRadarLeft(lastRadarTurnCmd);
+            setTurnRadarRight(lastRadarTurnCmd);
             return;
         }
 
         double bearing = radarBearingTo(target.x, target.y);
         double overshoot = (mode == Mode.SEARCH)
                 ? 35.0
-                : (getEnemyCount() <= 1 ? 20.0 : 28.0);
+                : (getEnemyCount() == 1 ? 20.0 : 28.0);
 
-        lastRadarTurnCmd = bearing + (bearing >= 0 ? overshoot : -overshoot);
-        radarDirection = lastRadarTurnCmd >= 0 ? 1 : -1;
-        setTurnRadarLeft(lastRadarTurnCmd);
+        lastRadarTurnCmd = bearing + (bearing >= 0.0 ? overshoot : -overshoot);
+        radarDirection = lastRadarTurnCmd >= 0.0 ? 1 : -1;
+        setTurnRadarRight(lastRadarTurnCmd);
     }
 
     private void handleGun() {
+        lastFirePowerCmd = 0.0;
+
         if (target == null) {
+            lastGunTurnCmd = 0.0;
             return;
         }
 
         int age = getTurnNumber() - target.lastSeenTurn;
+
         if (mode == Mode.SEARCH && age > SEARCH_SHOT_MAX_AGE) {
+            lastGunTurnCmd = 0.0;
             return;
         }
 
@@ -313,66 +337,95 @@ public class SpinRAM extends Bot {
         double gunTurn = gunBearingTo(target.x, target.y);
 
         lastGunTurnCmd = gunTurn;
-        setTurnGunLeft(gunTurn);
+        setTurnGunRight(gunTurn);
 
         double firepower = chooseFirepower(distance);
         if (mode == Mode.SEARCH) {
             firepower = Math.min(firepower, 1.0);
         }
 
-        boolean duel = getEnemyCount() <= 1;
-        boolean ramNow = shouldRam(distance);
+        boolean duel = getEnemyCount() == 1;
+        boolean ramNow = duel && shouldRam(distance);
 
         double tolerance;
-        if (ramNow) {
-            tolerance = 28.0;
+        if (duel && ramNow) {
+            tolerance = 30.0;
         } else if (duel) {
             tolerance = 35.0;
         } else {
-            tolerance = 24.0;
+            tolerance = 28.0;
         }
 
         if (getGunHeat() <= 0.10
                 && Math.abs(gunTurn) <= tolerance
                 && getEnergy() > firepower + 0.2) {
             setFire(firepower);
+            lastFirePowerCmd = firepower;
         }
     }
 
     private double chooseFirepower(double distance) {
-        boolean duel = getEnemyCount() <= 1;
+        boolean duel = getEnemyCount() == 1;
         boolean burstMode = duel && getTurnNumber() <= burstUntilTurn;
 
+        double myEnergy = getEnergy();
+        double enemyEnergy = (target != null) ? target.energy : 100.0;
+        double energyLead = myEnergy - enemyEnergy;
+
         double power;
-        if (shouldRam(distance)) {
-            power = 1.8;
+
+        if (duel && shouldRam(distance)) {
+            power = 2.2;
         } else if (mode == Mode.SEARCH) {
             power = 1.0;
         } else if (burstMode) {
-            power = 1.0;
+            power = 1.2;
         } else if (duel) {
-            if (distance < 140.0) {
-                power = 2.0;
-            } else if (distance < 320.0) {
-                power = 1.5;
+            if (energyLead > 20.0) {
+                if (distance < 140.0) {
+                    power = 2.6;
+                } else if (distance < 320.0) {
+                    power = 2.0;
+                } else {
+                    power = 1.4;
+                }
+            } else if (myEnergy < 25.0) {
+                if (distance < 180.0) {
+                    power = 1.4;
+                } else {
+                    power = 0.9;
+                }
             } else {
-                power = 1.1;
+                if (distance < 140.0) {
+                    power = 2.2;
+                } else if (distance < 320.0) {
+                    power = 1.7;
+                } else {
+                    power = 1.2;
+                }
             }
         } else {
-            if (distance < 150.0) {
-                power = 1.4;
-            } else if (distance < 340.0) {
-                power = 1.1;
+            if (myEnergy > 60.0 && distance < 170.0) {
+                power = 1.9;
+            } else if (myEnergy > 40.0 && distance < 260.0) {
+                power = 1.5;
+            } else if (distance < 180.0) {
+                power = 1.3;
             } else {
-                power = 0.9;
+                power = 1.0;
+            }
+
+            if (enemyEnergy < 12.0 && distance < 180.0 && myEnergy > 30.0) {
+                power = Math.max(power, 1.8);
+            }
+
+            if (myEnergy < 30.0) {
+                power = Math.min(power, 1.0);
             }
         }
 
-        if (target != null) {
-            power = Math.min(power, target.energy / 3.0 + 0.6);
-        }
-
-        power = Math.min(power, getEnergy() / 6.0 + 0.6);
+        power = Math.min(power, enemyEnergy / 3.0 + 0.8);
+        power = Math.min(power, myEnergy / 5.0 + 0.5);
 
         if (power < 0.5) power = 0.5;
         if (power > 3.0) power = 3.0;
@@ -380,7 +433,7 @@ public class SpinRAM extends Bot {
     }
 
     private boolean shouldRam(double distance) {
-        return getEnemyCount() <= 1
+        return getEnemyCount() == 1
                 && target != null
                 && target.energy < RAM_ENEMY_ENERGY
                 && getEnergy() > target.energy + RAM_ENERGY_ADVANTAGE
@@ -394,7 +447,7 @@ public class SpinRAM extends Bot {
             return;
         }
 
-        boolean duel = getEnemyCount() <= 1;
+        boolean duel = getEnemyCount() == 1;
 
         if (mode == Mode.SEARCH) {
             if (!duel) {
@@ -412,7 +465,7 @@ public class SpinRAM extends Bot {
         double targetDirection = directionTo(target.x, target.y);
         double distance = distanceTo(target.x, target.y);
 
-        if (shouldRam(distance)) {
+        if (duel && shouldRam(distance)) {
             goToDirection(targetDirection, Math.min(200.0, distance + 25.0));
             return;
         }
@@ -487,7 +540,7 @@ public class SpinRAM extends Bot {
         double centerDirection = directionTo(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
         double bearing = calcBearing(centerDirection);
         lastBodyTurnCmd = bearing;
-        setTurnLeft(bearing);
+        setTurnRight(bearing);
         setForward(WALL_ESCAPE_MOVE);
     }
 
@@ -498,13 +551,51 @@ public class SpinRAM extends Bot {
         if (Math.abs(bearing) > 90.0) {
             turn = (bearing > 0.0) ? bearing - 180.0 : bearing + 180.0;
             lastBodyTurnCmd = turn;
-            setTurnLeft(turn);
+            setTurnRight(turn);
             setBack(distance);
         } else {
             lastBodyTurnCmd = turn;
-            setTurnLeft(turn);
+            setTurnRight(turn);
             setForward(distance);
         }
+    }
+
+    private void debugTimingBeforeGo() {
+        if (LOG_MODE == LogMode.OFF) {
+            return;
+        }
+
+        int currentTurn = getTurnNumber();
+        long now = System.nanoTime();
+
+        if (previousObservedTurn != -1) {
+            int jump = currentTurn - previousObservedTurn;
+            if (jump > 1) {
+                suspectedSkippedTurns += (jump - 1);
+                System.out.println("[SpinRAM][WARN] suspected skipped turns: +" + (jump - 1)
+                        + " total=" + suspectedSkippedTurns
+                        + " currentTurn=" + currentTurn
+                        + " previousTurn=" + previousObservedTurn);
+            }
+        }
+
+        if (previousLoopStartNanos != 0L) {
+            long loopMillis = (now - previousLoopStartNanos) / 1_000_000L;
+            if (loopMillis > maxLoopMillis) {
+                maxLoopMillis = loopMillis;
+            }
+
+            if (loopMillis > 20L) {
+                suspectedSlowLoops++;
+                if (LOG_MODE == LogMode.VERBOSE) {
+                    System.out.println("[SpinRAM][WARN] slow loop " + loopMillis + " ms"
+                            + " count=" + suspectedSlowLoops);
+                }
+            }
+        }
+
+        previousObservedTurn = currentTurn;
+        previousLoopStartNanos = now;
     }
 
     private boolean tooCloseToWall() {
@@ -549,10 +640,14 @@ public class SpinRAM extends Bot {
                 + " bodyTurn=" + String.format(Locale.ROOT, "%.1f", lastBodyTurnCmd)
                 + " gunTurn=" + String.format(Locale.ROOT, "%.1f", lastGunTurnCmd)
                 + " radarTurn=" + String.format(Locale.ROOT, "%.1f", lastRadarTurnCmd)
+                + " fire=" + String.format(Locale.ROOT, "%.1f", lastFirePowerCmd)
                 + " enemies=" + enemies.size()
                 + " target=" + targetInfo
                 + " moveDir=" + moveDirection
-                + " radarDir=" + radarDirection);
+                + " radarDir=" + radarDirection
+                + " skipped?=" + suspectedSkippedTurns
+                + " slowLoops=" + suspectedSlowLoops
+                + " maxLoopMs=" + maxLoopMillis);
     }
 
     private double clamp(double value, double min, double max) {
