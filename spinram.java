@@ -14,21 +14,15 @@ import java.util.Map;
 
 public class SpinRAM extends Bot {
 
-    // =========================
-    // Debug
-    // =========================
     private enum LogMode {
         OFF,
         BASIC,
         VERBOSE
     }
 
-    private static final LogMode LOG_MODE = LogMode.VERBOSE; // OFF for submission
+    private static final LogMode LOG_MODE = LogMode.BASIC; // OFF for submission
     private static final int BASIC_LOG_EVERY_N_TURNS = 10;
 
-    // =========================
-    // Modes
-    // =========================
     private enum Mode {
         SEARCH,
         ATTACK,
@@ -50,10 +44,7 @@ public class SpinRAM extends Bot {
         }
     }
 
-    // =========================
-    // Tuning
-    // =========================
-    private static final double EDGE_BUFFER = 45.0;
+    private static final double EDGE_BUFFER = 35.0;
     private static final double EDGE_HOLD_MARGIN = 85.0;
     private static final double CORNER_AVOID = 130.0;
 
@@ -147,7 +138,6 @@ public class SpinRAM extends Bot {
             double energyDrop = previousEnergy - e.getEnergy();
             if (energyDrop >= 0.1 && energyDrop <= 3.0) {
                 enemy.possibleFireTurn = e.getTurnNumber();
-                logVerbose("Enemy #" + enemy.id + " likely fired. Drop=" + energyDrop);
             }
         }
 
@@ -165,7 +155,6 @@ public class SpinRAM extends Bot {
 
         if (target == null || isTargetStale(target)) {
             target = enemy;
-            logVerbose("New target from scan: #" + enemy.id);
             return;
         }
 
@@ -174,13 +163,11 @@ public class SpinRAM extends Bot {
             return;
         }
 
-        // In multiplayer, switch only if this target is clearly better.
         double currentDistance = distanceTo(target.x, target.y);
         double newDistance = distanceTo(enemy.x, enemy.y);
 
         if (newDistance < currentDistance * 0.85 || enemy.energy < target.energy - 15.0) {
             target = enemy;
-            logVerbose("Switched target to #" + enemy.id);
         }
     }
 
@@ -280,6 +267,13 @@ public class SpinRAM extends Bot {
 
     private void handleRadar() {
         if (target == null) {
+            setTurnRadarRight(45.0 * radarDirection);
+            return;
+        }
+
+        int age = getTurnNumber() - target.lastSeenTurn;
+
+        if (age > 2) {
             setTurnRadarRight(45.0 * radarDirection);
             return;
         }
@@ -421,26 +415,27 @@ public class SpinRAM extends Bot {
 
     private void handleMovement() {
         if (mode == Mode.ESCAPE_WALL) {
-            double centerDirection = directionTo(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
-            goToDirection(centerDirection, WALL_ESCAPE_MOVE);
+            escapeWall();
             return;
         }
 
+        boolean duel = getEnemyCount() <= 1;
+
         if (mode == Mode.SEARCH) {
-            if (getEnemyCount() > 1) {
+            if (!duel) {
                 moveToEdgeLane();
             } else {
                 if (getTurnNumber() % 18 == 0) {
                     moveDirection = -moveDirection;
                 }
-                goToDirection(normalizeAbsoluteAngle(getDirection() + 35.0 * moveDirection), SEARCH_MOVE);
+                double desiredDirection = getDirection() + 35.0 * moveDirection;
+                goToDirection(normalizeAbsoluteAngle(desiredDirection), SEARCH_MOVE);
             }
             return;
         }
 
         double targetDirection = directionTo(target.x, target.y);
         double distance = distanceTo(target.x, target.y);
-        boolean duel = getEnemyCount() <= 1;
 
         if (shouldRam(distance)) {
             goToDirection(targetDirection, Math.min(220.0, distance + 30.0));
@@ -513,6 +508,13 @@ public class SpinRAM extends Bot {
         };
     }
 
+    private void escapeWall() {
+        double centerDirection = directionTo(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
+        double bearing = calcBearing(centerDirection);
+        setTurnRight(bearing);
+        setForward(WALL_ESCAPE_MOVE);
+    }
+
     private boolean nearWall() {
         return getX() < EDGE_BUFFER
                 || getY() < EDGE_BUFFER
@@ -544,11 +546,6 @@ public class SpinRAM extends Bot {
         }
     }
 
-    private double normalizeAbsoluteAngle(double angle) {
-        double result = angle % 360.0;
-        return result < 0.0 ? result + 360.0 : result;
-    }
-
     private void debugTurn() {
         if (LOG_MODE == LogMode.OFF) {
             return;
@@ -568,17 +565,15 @@ public class SpinRAM extends Bot {
                     + " age=" + age;
         }
 
-        System.out.println(
-                "[SpinRAM] turn=" + getTurnNumber()
-                        + " mode=" + mode
-                        + " pos=(" + (int) getX() + "," + (int) getY() + ")"
-                        + " energy=" + (int) getEnergy()
-                        + " gunHeat=" + String.format(Locale.ROOT, "%.2f", getGunHeat())
-                        + " enemies=" + enemies.size()
-                        + " target=" + targetInfo
-                        + " moveDir=" + moveDirection
-                        + " radarDir=" + radarDirection
-        );
+        System.out.println("[SpinRAM] turn=" + getTurnNumber()
+                + " mode=" + mode
+                + " pos=(" + (int) getX() + "," + (int) getY() + ")"
+                + " energy=" + (int) getEnergy()
+                + " gunHeat=" + String.format(Locale.ROOT, "%.2f", getGunHeat())
+                + " enemies=" + enemies.size()
+                + " target=" + targetInfo
+                + " moveDir=" + moveDirection
+                + " radarDir=" + radarDirection);
     }
 
     private void logVerbose(String msg) {
