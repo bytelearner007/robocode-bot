@@ -20,7 +20,7 @@ public class SpinRAM extends Bot {
         VERBOSE
     }
 
-    private static final LogMode LOG_MODE = LogMode.BASIC; // OFF for submission
+    private static final LogMode LOG_MODE = LogMode.OFF; // OFF for submission
     private static final int BASIC_LOG_EVERY_N_TURNS = 10;
 
     private enum Mode {
