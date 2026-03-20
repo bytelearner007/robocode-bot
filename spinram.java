@@ -7,51 +7,79 @@ import dev.robocode.tankroyale.botapi.events.HitWallEvent;
 import dev.robocode.tankroyale.botapi.events.ScannedBotEvent;
 import dev.robocode.tankroyale.botapi.graphics.Color;
 
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Locale;
+import java.util.Map;
+
 public class SpinRAM extends Bot {
 
-    // ===== Easy switches =====
-    private static final boolean DEBUG = false; // true for local debugging, false for submission
+    // =========================
+    // Debug
+    // =========================
+    private enum LogMode {
+        OFF,
+        BASIC,
+        VERBOSE
+    }
 
-    // ===== Target handling =====
-    private static final int TARGET_FRESH_TURNS = 14;
-    private static final int SEARCH_SHOT_MAX_AGE = 3;
+    private static final LogMode LOG_MODE = LogMode.VERBOSE; // OFF for submission
+    private static final int BASIC_LOG_EVERY_N_TURNS = 10;
 
-    // ===== Movement =====
-    private static final double WALL_MARGIN = 70.0;
-    private static final double SEARCH_TURN = 35.0;
-    private static final double SEARCH_MOVE = 75.0;
-    private static final double ATTACK_TURN = 30.0;
-    private static final double ATTACK_MOVE = 90.0;
-    private static final double CLOSE_BACKOFF = 45.0;
-    private static final double WALL_ESCAPE_MOVE = 120.0;
-
-    // ===== Ram behavior =====
-    private static final double RAM_DISTANCE = 160.0;
-    private static final double RAM_ENEMY_ENERGY = 12.0;
-    private static final double RAM_ENERGY_ADVANTAGE = 12.0;
-    private static final double RAM_EXTRA = 35.0;
-    private static final double MAX_RAM_DRIVE = 220.0;
-
-    // ===== Search-shot =====
-    private static final double SEARCH_SHOT_POWER = 1.0;
-
+    // =========================
+    // Modes
+    // =========================
     private enum Mode {
         SEARCH,
         ATTACK,
         ESCAPE_WALL
     }
 
+    private static class Enemy {
+        final int id;
+        double x;
+        double y;
+        double energy;
+        double direction;
+        double speed;
+        int lastSeenTurn;
+        int possibleFireTurn = -9999;
+
+        Enemy(int id) {
+            this.id = id;
+        }
+    }
+
+    // =========================
+    // Tuning
+    // =========================
+    private static final double EDGE_BUFFER = 45.0;
+    private static final double EDGE_HOLD_MARGIN = 85.0;
+    private static final double CORNER_AVOID = 130.0;
+
+    private static final double SEARCH_MOVE = 65.0;
+    private static final double ATTACK_MOVE = 110.0;
+    private static final double WALL_ESCAPE_MOVE = 150.0;
+    private static final double EDGE_HOLD_STEP = 145.0;
+
+    private static final int TARGET_STALE_TURNS = 16;
+    private static final int DROP_TARGET_TURNS = 40;
+    private static final int SEARCH_SHOT_MAX_AGE = 3;
+    private static final int BURST_TURNS = 6;
+
+    private static final double RAM_DISTANCE = 165.0;
+    private static final double RAM_ENEMY_ENERGY = 12.0;
+    private static final double RAM_ENERGY_ADVANTAGE = 10.0;
+
+    private final Map<Integer, Enemy> enemies = new HashMap<>();
+
     private Mode mode = Mode.SEARCH;
+    private Enemy target;
 
-    // Spin direction: clockwise or counterclockwise
-    private int spinDirection = 1;
-
-    // Last known target state
-    private int targetId = -1;
-    private double targetX;
-    private double targetY;
-    private double targetEnergy = 100.0;
-    private int targetLastSeenTurn = -9999;
+    private double moveDirection = 1.0;
+    private int radarDirection = 1;
+    private boolean reverseNextTurn = false;
+    private int burstUntilTurn = -1;
 
     public static void main(String[] args) {
         new SpinRAM().start();
@@ -63,6 +91,39 @@ public class SpinRAM extends Bot {
 
     @Override
     public void run() {
+        initializeRound();
+
+        while (isRunning()) {
+            cleanupOldEnemies();
+
+            if (target == null || isTargetStale(target)) {
+                pickTarget();
+            }
+
+            if (reverseNextTurn) {
+                moveDirection = -moveDirection;
+                reverseNextTurn = false;
+            }
+
+            resolveMode();
+            handleRadar();
+            handleGun();
+            handleMovement();
+
+            go();
+            debugTurn();
+        }
+    }
+
+    private void initializeRound() {
+        enemies.clear();
+        target = null;
+        mode = Mode.SEARCH;
+        moveDirection = 1.0;
+        radarDirection = 1;
+        reverseNextTurn = false;
+        burstUntilTurn = -1;
+
         setBodyColor(Color.fromRgb(0xF2, 0xF2, 0xF2));
         setTurretColor(Color.fromRgb(0xCC, 0xCC, 0xCC));
         setGunColor(Color.fromRgb(0xCC, 0xCC, 0xCC));
@@ -71,197 +132,254 @@ public class SpinRAM extends Bot {
         setBulletColor(Color.fromRgb(0xFF, 0x66, 0x00));
         setTracksColor(Color.fromRgb(0x66, 0x66, 0x66));
 
-        setMaxSpeed(6);
-
-        debug("SpinRAM initialized");
-
-        while (isRunning()) {
-            if (nearWall()) {
-                mode = Mode.ESCAPE_WALL;
-                debug("Mode=ESCAPE_WALL");
-                escapeWall();
-                continue;
-            }
-
-            if (!hasFreshTarget()) {
-                mode = Mode.SEARCH;
-                debug("Mode=SEARCH");
-                searchSpin();
-                continue;
-            }
-
-            mode = Mode.ATTACK;
-            debug("Mode=ATTACK target=#" + targetId);
-            attackOrRam();
-        }
+        setAdjustGunForBodyTurn(true);
+        setAdjustRadarForBodyTurn(true);
+        setAdjustRadarForGunTurn(true);
+        setMaxSpeed(8);
     }
 
     @Override
     public void onScannedBot(ScannedBotEvent e) {
-        double newDistance = distanceTo(e.getX(), e.getY());
-        double currentDistance = hasAnyTarget() ? distanceTo(targetX, targetY) : Double.POSITIVE_INFINITY;
+        Enemy enemy = enemies.computeIfAbsent(e.getScannedBotId(), Enemy::new);
 
-        boolean shouldReplace =
-                !hasAnyTarget()
-                || e.getScannedBotId() == targetId
-                || !hasFreshTarget()
-                || newDistance < currentDistance * 0.85
-                || e.getEnergy() < targetEnergy - 15.0;
-
-        if (shouldReplace) {
-            targetId = e.getScannedBotId();
-            targetX = e.getX();
-            targetY = e.getY();
-            targetEnergy = e.getEnergy();
-            targetLastSeenTurn = e.getTurnNumber();
-
-            debug("Scanned target #" + targetId
-                    + " pos=(" + (int) targetX + "," + (int) targetY + ")"
-                    + " energy=" + (int) targetEnergy);
-
-            // Opportunistic shot as soon as target is found
-            double distance = distanceTo(targetX, targetY);
-            turnToFaceTarget(targetX, targetY);
-
-            if (getGunHeat() <= 0.10) {
-                if (shouldRam(distance, targetEnergy)) {
-                    fire(ramFirePower(targetEnergy));
-                } else {
-                    fire(chooseFirePower(distance, targetEnergy));
-                }
+        double previousEnergy = enemy.energy;
+        if (enemy.lastSeenTurn > 0) {
+            double energyDrop = previousEnergy - e.getEnergy();
+            if (energyDrop >= 0.1 && energyDrop <= 3.0) {
+                enemy.possibleFireTurn = e.getTurnNumber();
+                logVerbose("Enemy #" + enemy.id + " likely fired. Drop=" + energyDrop);
             }
+        }
+
+        enemy.x = e.getX();
+        enemy.y = e.getY();
+        enemy.energy = e.getEnergy();
+        enemy.direction = e.getDirection();
+        enemy.speed = e.getSpeed();
+        enemy.lastSeenTurn = e.getTurnNumber();
+
+        if (target != null && target.id == enemy.id) {
+            target = enemy;
+            return;
+        }
+
+        if (target == null || isTargetStale(target)) {
+            target = enemy;
+            logVerbose("New target from scan: #" + enemy.id);
+            return;
+        }
+
+        if (getEnemyCount() <= 1) {
+            target = enemy;
+            return;
+        }
+
+        // In multiplayer, switch only if this target is clearly better.
+        double currentDistance = distanceTo(target.x, target.y);
+        double newDistance = distanceTo(enemy.x, enemy.y);
+
+        if (newDistance < currentDistance * 0.85 || enemy.energy < target.energy - 15.0) {
+            target = enemy;
+            logVerbose("Switched target to #" + enemy.id);
         }
     }
 
     @Override
     public void onBotDeath(BotDeathEvent e) {
-        if (e.getVictimId() == targetId) {
-            debug("Target died -> clearing");
-            clearTarget();
+        enemies.remove(e.getVictimId());
+        if (target != null && target.id == e.getVictimId()) {
+            target = null;
         }
     }
 
     @Override
     public void onHitByBullet(HitByBulletEvent e) {
-        spinDirection = -spinDirection;
-        debug("Hit by bullet -> reversing spin");
+        reverseNextTurn = true;
     }
 
     @Override
     public void onHitWall(HitWallEvent e) {
-        spinDirection = -spinDirection;
-        debug("Hit wall -> reversing spin");
+        reverseNextTurn = true;
     }
 
     @Override
     public void onHitBot(HitBotEvent e) {
-        targetId = e.getVictimId();
-        targetX = e.getX();
-        targetY = e.getY();
-        targetEnergy = e.getEnergy();
-        targetLastSeenTurn = getTurnNumber();
-
-        debug("Hit bot #" + targetId);
-
-        turnToFaceTarget(targetX, targetY);
-
-        if (getGunHeat() <= 0.10) {
-            if (shouldRam(distanceTo(targetX, targetY), targetEnergy)) {
-                fire(ramFirePower(targetEnergy));
-                forward(40);
-            } else {
-                fire(chooseFirePower(distanceTo(targetX, targetY), targetEnergy));
-                back(30);
-                spinDirection = -spinDirection;
-            }
-        }
+        reverseNextTurn = true;
     }
 
-    private void searchSpin() {
-        // If target was seen very recently, shoot at last known position while searching
-        if (hasAnyTarget()) {
-            int age = getTurnNumber() - targetLastSeenTurn;
+    private void cleanupOldEnemies() {
+        int now = getTurnNumber();
+        Iterator<Map.Entry<Integer, Enemy>> it = enemies.entrySet().iterator();
 
-            if (age <= SEARCH_SHOT_MAX_AGE) {
-                debug("SEARCH_SHOT target=#" + targetId + " age=" + age);
-
-                turnToFaceTarget(targetX, targetY);
-
-                if (getGunHeat() <= 0.10) {
-                    double distance = distanceTo(targetX, targetY);
-                    double power = Math.min(SEARCH_SHOT_POWER, chooseFirePower(distance, targetEnergy));
-                    fire(power);
+        while (it.hasNext()) {
+            Enemy enemy = it.next().getValue();
+            if (now - enemy.lastSeenTurn > DROP_TARGET_TURNS) {
+                if (target != null && target.id == enemy.id) {
+                    target = null;
                 }
+                it.remove();
+            }
+        }
+    }
 
-                turnRight(20.0 * spinDirection);
-                forward(SEARCH_MOVE / 2.0);
-                rescan();
-                return;
+    private void pickTarget() {
+        Enemy best = null;
+        double bestScore = Double.POSITIVE_INFINITY;
+        int now = getTurnNumber();
+
+        for (Enemy enemy : enemies.values()) {
+            int age = now - enemy.lastSeenTurn;
+            if (age > TARGET_STALE_TURNS) {
+                continue;
+            }
+
+            double distance = distanceTo(enemy.x, enemy.y);
+            double score = distance + age * 25.0 + enemy.energy * 3.0;
+
+            if (enemy.possibleFireTurn >= now - 1) {
+                score -= 25.0;
+            }
+
+            if (target != null && target.id == enemy.id) {
+                score -= 20.0;
+            }
+
+            if (getEnemyCount() > 1 && enemy.energy < 20.0) {
+                score -= 20.0;
+            }
+
+            if (score < bestScore) {
+                bestScore = score;
+                best = enemy;
             }
         }
 
-        turnRight(SEARCH_TURN * spinDirection);
-        forward(SEARCH_MOVE);
+        target = best;
     }
 
-    private void attackOrRam() {
-        double distance = distanceTo(targetX, targetY);
-
-        turnToFaceTarget(targetX, targetY);
-
-        if (shouldRam(distance, targetEnergy)) {
-            debug("RAM target=#" + targetId + " distance=" + (int) distance);
-
-            if (getGunHeat() <= 0.10) {
-                fire(ramFirePower(targetEnergy));
-            }
-
-            forward(Math.min(distance + RAM_EXTRA, MAX_RAM_DRIVE));
+    private void resolveMode() {
+        if (nearWall()) {
+            mode = Mode.ESCAPE_WALL;
             return;
         }
 
-        debug("ATTACK target=#" + targetId + " distance=" + (int) distance);
-
-        if (getGunHeat() <= 0.10) {
-            fire(chooseFirePower(distance, targetEnergy));
+        if (target == null || isTargetStale(target)) {
+            mode = Mode.SEARCH;
+            return;
         }
 
-        if (distance < 120.0) {
-            turnRight(55.0 * spinDirection);
-            back(CLOSE_BACKOFF);
+        mode = Mode.ATTACK;
+
+        boolean duel = getEnemyCount() <= 1;
+        double distance = distanceTo(target.x, target.y);
+
+        if (duel && target.energy < 20.0 && distance < 250.0) {
+            burstUntilTurn = Math.max(burstUntilTurn, getTurnNumber() + BURST_TURNS);
+        }
+    }
+
+    private void handleRadar() {
+        if (target == null) {
+            setTurnRadarRight(45.0 * radarDirection);
+            return;
+        }
+
+        double bearing = radarBearingTo(target.x, target.y);
+
+        if (mode == Mode.SEARCH) {
+            double turn = bearing + (bearing >= 0 ? 35.0 : -35.0);
+            if (Math.abs(turn) < 8.0) {
+                turn = 45.0 * radarDirection;
+            }
+            radarDirection = turn >= 0 ? 1 : -1;
+            setTurnRadarRight(turn);
+            return;
+        }
+
+        double overshoot = (getEnemyCount() <= 1) ? 18.0 : 28.0;
+        double turn = bearing + (bearing >= 0 ? overshoot : -overshoot);
+        radarDirection = turn >= 0 ? 1 : -1;
+        setTurnRadarRight(turn);
+    }
+
+    private void handleGun() {
+        if (target == null) {
+            return;
+        }
+
+        int age = getTurnNumber() - target.lastSeenTurn;
+
+        if (mode == Mode.SEARCH && age > SEARCH_SHOT_MAX_AGE) {
+            return;
+        }
+
+        double distance = distanceTo(target.x, target.y);
+        double firepower = chooseFirepower(distance);
+
+        if (mode == Mode.SEARCH) {
+            firepower = Math.min(firepower, 1.0);
+        }
+
+        double[] aim = predictLinearPosition(target, firepower);
+        double directTurn = gunBearingTo(target.x, target.y);
+        double predictedTurn = gunBearingTo(aim[0], aim[1]);
+        double gunTurn = Math.abs(predictedTurn) <= 25.0 ? predictedTurn : directTurn;
+
+        setTurnGunRight(gunTurn);
+
+        boolean duel = getEnemyCount() <= 1;
+        boolean ramNow = shouldRam(distance);
+
+        double tolerance;
+        if (ramNow) {
+            tolerance = 18.0;
+        } else if (duel) {
+            tolerance = 14.0;
         } else {
-            turnRight(ATTACK_TURN * spinDirection);
-            forward(ATTACK_MOVE);
+            tolerance = 12.0;
         }
 
-        rescan();
+        if (getGunHeat() <= 0.05
+                && Math.abs(gunTurn) <= tolerance
+                && getEnergy() > firepower + 0.2) {
+            setFire(firepower);
+        }
     }
 
-    private boolean shouldRam(double distance, double enemyEnergy) {
-        return distance <= RAM_DISTANCE
-                && enemyEnergy <= RAM_ENEMY_ENERGY
-                && getEnergy() > enemyEnergy + RAM_ENERGY_ADVANTAGE
-                && !nearWall();
-    }
+    private double chooseFirepower(double distance) {
+        boolean duel = getEnemyCount() <= 1;
+        boolean burstMode = duel && getTurnNumber() <= burstUntilTurn;
 
-    private double chooseFirePower(double distance, double enemyEnergy) {
         double power;
-
-        if (distance < 110.0) {
-            power = 2.6;
-        } else if (distance < 260.0) {
-            power = 1.9;
+        if (shouldRam(distance)) {
+            power = 2.4;
+        } else if (mode == Mode.SEARCH) {
+            power = 1.0;
+        } else if (burstMode) {
+            power = 1.0;
+        } else if (duel) {
+            if (distance < 140.0) {
+                power = 2.4;
+            } else if (distance < 320.0) {
+                power = 1.8;
+            } else {
+                power = 1.2;
+            }
         } else {
-            power = 1.2;
+            if (distance < 150.0) {
+                power = 1.7;
+            } else if (distance < 340.0) {
+                power = 1.25;
+            } else {
+                power = 1.0;
+            }
         }
 
-        // Don't waste huge bullets on a nearly dead bot
-        if (enemyEnergy < 8.0) {
-            power = Math.min(power, 1.5);
+        if (target != null) {
+            power = Math.min(power, target.energy / 3.0 + 0.6);
         }
 
-        // Protect our own energy a bit
-        power = Math.min(power, Math.max(0.8, getEnergy() / 8.0));
+        power = Math.min(power, getEnergy() / 6.0 + 0.6);
 
         if (power < 0.5) power = 0.5;
         if (power > 3.0) power = 3.0;
@@ -269,54 +387,207 @@ public class SpinRAM extends Bot {
         return power;
     }
 
-    private double ramFirePower(double enemyEnergy) {
-        if (enemyEnergy > 8.0) return 2.0;
-        if (enemyEnergy > 4.0) return 1.0;
-        if (enemyEnergy > 2.0) return 0.5;
-        return 0.1;
+    private boolean shouldRam(double distance) {
+        return getEnemyCount() <= 1
+                && target != null
+                && target.energy < RAM_ENEMY_ENERGY
+                && getEnergy() > target.energy + RAM_ENERGY_ADVANTAGE
+                && distance < RAM_DISTANCE
+                && !nearWall();
     }
 
-    private void escapeWall() {
-        debug("Escaping wall");
-        turnToFaceTarget(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
-        forward(WALL_ESCAPE_MOVE);
-    }
+    private double[] predictLinearPosition(Enemy enemy, double firepower) {
+        double bulletSpeed = Math.max(0.1, calcBulletSpeed(firepower));
 
-    private void turnToFaceTarget(double x, double y) {
-        double bearing = bearingTo(x, y);
+        double vx = Math.cos(Math.toRadians(enemy.direction)) * enemy.speed;
+        double vy = Math.sin(Math.toRadians(enemy.direction)) * enemy.speed;
 
-        if (bearing >= 0) {
-            spinDirection = 1;
-        } else {
-            spinDirection = -1;
+        double px = enemy.x;
+        double py = enemy.y;
+
+        for (int i = 0; i < 5; i++) {
+            double distance = distanceTo(px, py);
+            double time = distance / bulletSpeed;
+
+            px = enemy.x + vx * time;
+            py = enemy.y + vy * time;
+
+            px = clamp(px, EDGE_BUFFER, getArenaWidth() - EDGE_BUFFER);
+            py = clamp(py, EDGE_BUFFER, getArenaHeight() - EDGE_BUFFER);
         }
 
-        turnLeft(bearing);
+        return new double[]{px, py};
     }
 
-    private boolean hasAnyTarget() {
-        return targetId != -1;
+    private void handleMovement() {
+        if (mode == Mode.ESCAPE_WALL) {
+            double centerDirection = directionTo(getArenaWidth() / 2.0, getArenaHeight() / 2.0);
+            goToDirection(centerDirection, WALL_ESCAPE_MOVE);
+            return;
+        }
+
+        if (mode == Mode.SEARCH) {
+            if (getEnemyCount() > 1) {
+                moveToEdgeLane();
+            } else {
+                if (getTurnNumber() % 18 == 0) {
+                    moveDirection = -moveDirection;
+                }
+                goToDirection(normalizeAbsoluteAngle(getDirection() + 35.0 * moveDirection), SEARCH_MOVE);
+            }
+            return;
+        }
+
+        double targetDirection = directionTo(target.x, target.y);
+        double distance = distanceTo(target.x, target.y);
+        boolean duel = getEnemyCount() <= 1;
+
+        if (shouldRam(distance)) {
+            goToDirection(targetDirection, Math.min(220.0, distance + 30.0));
+            return;
+        }
+
+        if (recentlyFiredAtUs(target) || getTurnNumber() % (duel ? 24 : 30) == 0) {
+            moveDirection = -moveDirection;
+        }
+
+        if (!duel) {
+            moveToEdgeLane();
+            return;
+        }
+
+        double desiredDirection;
+        if (distance < 140.0) {
+            desiredDirection = targetDirection + 120.0 * moveDirection;
+        } else if (distance > 380.0) {
+            desiredDirection = targetDirection + 60.0 * moveDirection;
+        } else {
+            desiredDirection = targetDirection + 90.0 * moveDirection;
+        }
+
+        goToDirection(normalizeAbsoluteAngle(desiredDirection), ATTACK_MOVE);
     }
 
-    private boolean hasFreshTarget() {
-        return hasAnyTarget() && (getTurnNumber() - targetLastSeenTurn <= TARGET_FRESH_TURNS);
+    private void moveToEdgeLane() {
+        double[] waypoint = edgeLaneWaypoint();
+        double absoluteDirection = directionTo(waypoint[0], waypoint[1]);
+        double distance = Math.min(distanceTo(waypoint[0], waypoint[1]), EDGE_HOLD_STEP);
+        goToDirection(absoluteDirection, distance);
+    }
+
+    private double[] edgeLaneWaypoint() {
+        double x = getX();
+        double y = getY();
+        double w = getArenaWidth();
+        double h = getArenaHeight();
+
+        double left = x;
+        double right = w - x;
+        double bottom = y;
+        double top = h - y;
+
+        if (left <= right && left <= bottom && left <= top) {
+            return new double[]{
+                    EDGE_HOLD_MARGIN,
+                    clamp(y + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, h - CORNER_AVOID)
+            };
+        }
+
+        if (right <= left && right <= bottom && right <= top) {
+            return new double[]{
+                    w - EDGE_HOLD_MARGIN,
+                    clamp(y + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, h - CORNER_AVOID)
+            };
+        }
+
+        if (bottom <= left && bottom <= right && bottom <= top) {
+            return new double[]{
+                    clamp(x + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, w - CORNER_AVOID),
+                    EDGE_HOLD_MARGIN
+            };
+        }
+
+        return new double[]{
+                clamp(x + moveDirection * EDGE_HOLD_STEP, CORNER_AVOID, w - CORNER_AVOID),
+                h - EDGE_HOLD_MARGIN
+        };
     }
 
     private boolean nearWall() {
-        return getX() < WALL_MARGIN
-                || getY() < WALL_MARGIN
-                || getX() > getArenaWidth() - WALL_MARGIN
-                || getY() > getArenaHeight() - WALL_MARGIN;
+        return getX() < EDGE_BUFFER
+                || getY() < EDGE_BUFFER
+                || getX() > getArenaWidth() - EDGE_BUFFER
+                || getY() > getArenaHeight() - EDGE_BUFFER;
     }
 
-    private void clearTarget() {
-        targetId = -1;
-        targetLastSeenTurn = -9999;
+    private boolean isTargetStale(Enemy enemy) {
+        return enemy == null || (getTurnNumber() - enemy.lastSeenTurn > TARGET_STALE_TURNS);
     }
 
-    private void debug(String msg) {
-        if (DEBUG) {
-            System.out.println("[SpinRAM] turn=" + getTurnNumber() + " " + msg);
+    private boolean recentlyFiredAtUs(Enemy enemy) {
+        return enemy != null && getTurnNumber() - enemy.possibleFireTurn <= 1;
+    }
+
+    private void goToDirection(double absoluteDirection, double distance) {
+        double bearing = calcBearing(absoluteDirection);
+
+        if (Math.abs(bearing) > 90.0) {
+            if (bearing > 0.0) {
+                setTurnRight(bearing - 180.0);
+            } else {
+                setTurnRight(bearing + 180.0);
+            }
+            setBack(distance);
+        } else {
+            setTurnRight(bearing);
+            setForward(distance);
         }
+    }
+
+    private double normalizeAbsoluteAngle(double angle) {
+        double result = angle % 360.0;
+        return result < 0.0 ? result + 360.0 : result;
+    }
+
+    private void debugTurn() {
+        if (LOG_MODE == LogMode.OFF) {
+            return;
+        }
+        if (LOG_MODE == LogMode.BASIC && getTurnNumber() % BASIC_LOG_EVERY_N_TURNS != 0) {
+            return;
+        }
+
+        String targetInfo;
+        if (target == null) {
+            targetInfo = "NONE";
+        } else {
+            int age = getTurnNumber() - target.lastSeenTurn;
+            targetInfo = "#" + target.id
+                    + " pos=(" + (int) target.x + "," + (int) target.y + ")"
+                    + " e=" + (int) target.energy
+                    + " age=" + age;
+        }
+
+        System.out.println(
+                "[SpinRAM] turn=" + getTurnNumber()
+                        + " mode=" + mode
+                        + " pos=(" + (int) getX() + "," + (int) getY() + ")"
+                        + " energy=" + (int) getEnergy()
+                        + " gunHeat=" + String.format(Locale.ROOT, "%.2f", getGunHeat())
+                        + " enemies=" + enemies.size()
+                        + " target=" + targetInfo
+                        + " moveDir=" + moveDirection
+                        + " radarDir=" + radarDirection
+        );
+    }
+
+    private void logVerbose(String msg) {
+        if (LOG_MODE == LogMode.VERBOSE) {
+            System.out.println(msg);
+        }
+    }
+
+    private double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 }
